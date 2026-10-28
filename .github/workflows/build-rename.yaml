@@ -1,41 +1,14 @@
 name: build-rename
 
-# Renames all artifacts to a chosen name and pushes the result to the
-# branch rename_<name> — ready to pull with abapGit for a parallel
-# installation in the same SAP system (see
-# https://abap2ui5.github.io/docs/advanced/renaming.html). The name is
-# either a customer name (ZMYUI5: z2ui5_cl_ui5_client becomes
-# zmyui5_cl_ui5_client, branch rename_zmyui5) or a registered namespace
-# (/CA2UI5/: z2ui5_cl_ui5_client becomes /ca2ui5/cl_ui5_client, branch
-# rename_ca2ui5; abapGit stores it as #ca2ui5#cl_ui5_client, and the
-# target system needs the namespace set up in SE03 and a /CA2UI5/ package
-# to pull into). The renaming itself is the plain abaplint rename with the
-# checked-in config .github/abaplint/rename.jsonc; this workflow only sets
-# the chosen prefix in the config (placeholder "znamespace_") and stores
-# the result.
-# The frontend BSP that goes with it is built by frontend_deploy with the
-# branch name standard_<name>__<name> (standard_#abap2ui5#__#abap2ui5#,
-# standard_zmyui5__zmyui5): its ICF handler then calls the renamed backend
-# class <prefix>cl_http_handler instead of z2ui5_cl_http_handler (see
-# tools/bsp_rename). Run this workflow first - the lint of that build
-# reads the backend from the branch rename_<name> pushed here.
-# Re-running with the same name updates the branch to the current main
-# state; without content changes nothing is pushed. The main commit is
-# carried as second parent so GitHub shows the branch as "ahead" instead
-# of "behind" main.
-
 on:
   workflow_dispatch:
     inputs:
       namespace:
-        description: "New name: ZMYUI5 (max. 10 characters) or a registered namespace /CA2UI5/ (max. 10 with both slashes)"
+        description: "SAP namespace, e.g. #SCT# or #SCT#AU5"
         required: true
         type: string
-        default: znamespace
+        default: "#SCT#"
 
-# read at the workflow level, write on the one job that pushes the branch -
-# the shape every other writing workflow here has. It was `contents: write`
-# for the whole workflow, the only one of them.
 permissions:
   contents: read
 
@@ -47,91 +20,501 @@ jobs:
   build_rename:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     permissions:
       contents: write
+
     env:
       NAMESPACE: ${{ inputs.namespace }}
+
     steps:
-    # validate the input and derive the object name prefix and the branch
-    # name before building. A customer name ZMYUI5 takes the place of z2ui5
-    # (prefix zmyui5_), a namespace /CA2UI5/ the place of z2ui5_ (prefix
-    # /ca2ui5/) - both at most 10 characters, which keeps a 25-character
-    # object name within the 30-character limit (rename.jsonc)
-    - name: Derive prefix and branch name
-      run: |
-        ns=$(printf '%s' "$NAMESPACE" | tr '[:upper:]' '[:lower:]')
-        if printf '%s' "$ns" | grep -Eq '^[a-z][a-z0-9_]{0,9}$'; then
-          if [ "$ns" = "z2ui5" ]; then
-            echo "::error::Name '$NAMESPACE' is the original name - nothing to rename"
+      # ---------------------------------------------------------------
+      # Build the different namespace representations.
+      #
+      # Example input:
+      #   #SCT#AU5
+      #
+      # Results:
+      #   TECH_NAMESPACE = sct_au5
+      #   SAP_NAMESPACE  = /sct/au5
+      #   GIT_NAMESPACE  = #sct#au5
+      #   CLEAN_NAMESPACE = sctau5
+      #   BRANCH         = rename_sct_au5
+      # ---------------------------------------------------------------
+      - name: Derive namespace and branch name
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          raw="$NAMESPACE"
+
+          # Remove leading and trailing whitespace.
+          raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+          first=""
+          second=""
+
+          # Format: #SCT#
+          if [[ "$raw" =~ ^#([A-Za-z][A-Za-z0-9_]*)#$ ]]; then
+            first="${BASH_REMATCH[1]}"
+
+          # Format: #SCT#AU5
+          elif [[ "$raw" =~ ^#([A-Za-z][A-Za-z0-9_]*)#([A-Za-z][A-Za-z0-9_]*)$ ]]; then
+            first="${BASH_REMATCH[1]}"
+            second="${BASH_REMATCH[2]}"
+
+          # Format: SCT
+          elif [[ "$raw" =~ ^([A-Za-z][A-Za-z0-9_]*)$ ]]; then
+            first="${BASH_REMATCH[1]}"
+
+          # Format: SCT_AU5
+          elif [[ "$raw" =~ ^([A-Za-z][A-Za-z0-9_]*)_([A-Za-z][A-Za-z0-9_]*)$ ]]; then
+            first="${BASH_REMATCH[1]}"
+            second="${BASH_REMATCH[2]}"
+
+          else
+            echo "::error::Invalid namespace '$NAMESPACE'."
+            echo "::error::Use #SCT#, #SCT#AU5, SCT or SCT_AU5."
             exit 1
           fi
-          prefix="${ns}_"
-          name="$ns"
-        elif printf '%s' "$ns" | grep -Eq '^/[a-z0-9][a-z0-9_]{0,7}/$'; then
-          prefix="$ns"
-          name=$(printf '%s' "$ns" | tr -d '/')
-        else
-          echo "::error::Invalid name '$NAMESPACE' (a customer name: letter + letters/digits/underscore, max. 10 characters, e.g. ZMYUI5 - or a namespace with both slashes, max. 10 characters, e.g. /CA2UI5/)"
-          exit 1
-        fi
-        echo "PREFIX=$prefix" >> "$GITHUB_ENV"
-        echo "BRANCH=rename_$name" >> "$GITHUB_ENV"
-        echo "Renaming z2ui5_ to $prefix, building branch: rename_$name"
 
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-    - uses: ./.github/actions/setup
-      with:
-        npm-ci: "true"
+          first_lower="$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')"
+          second_lower="$(printf '%s' "$second" | tr '[:upper:]' '[:lower:]')"
 
-    # set the chosen prefix in the rename config and run the abaplint
-    # rename; it writes the renamed sources to
-    # .github/abaplint/output/<workspace path>/src. `|` as the sed
-    # delimiter: a namespace prefix carries slashes, neither carries a `|`
-    - name: Rename to ${{ inputs.namespace }}
-      run: |
-        sed "s|znamespace_|$PREFIX|g" .github/abaplint/rename.jsonc > .github/abaplint/rename_run.jsonc
-        npx abaplint .github/abaplint/rename_run.jsonc --rename
+          # Validate the namespace components.
+          if ! printf '%s' "$first_lower" | grep -Eq '^[a-z][a-z0-9_]{0,9}$'; then
+            echo "::error::Invalid first namespace component '$first'."
+            exit 1
+          fi
 
-    # abaplint --rename rewrites references, never string literals: a literal
-    # still naming an object by its original name makes the renamed
-    # installation look up the ORIGINAL object (every app start refused, no
-    # user exit found). check:rename keeps them out of the sources; this
-    # proves it on the tree that is about to be pushed
-    - name: No literal kept the original name
-      run: node .github/scripts/rename-literal-gate.mjs --renamed .github/abaplint/output
+          if [ -n "$second_lower" ] &&
+             ! printf '%s' "$second_lower" | grep -Eq '^[a-z][a-z0-9_]{0,9}$'; then
+            echo "::error::Invalid second namespace component '$second'."
+            exit 1
+          fi
 
-    # branch content: the renamed src tree plus the abapGit descriptor
-    # (version constant turned to the renamed interface) and the license
-    - name: Assemble branch content
-      run: |
-        src=$(find .github/abaplint/output -type d -name src | head -n 1)
-        if [ -z "$src" ]; then
-          echo "::error::no renamed src folder found under .github/abaplint/output"
-          exit 1
-        fi
-        out=".github/out/$BRANCH"
-        rm -rf "$out"
-        mkdir -p "$out"
-        cp -r "$src" "$out/src"
-        cp LICENSE "$out/"
-        prefix_upper=$(printf '%s' "$PREFIX" | tr '[:lower:]' '[:upper:]')
-        sed "s|Z2UI5_IF_APP|${prefix_upper}IF_APP|" .abapgit.xml > "$out/.abapgit.xml"
+          if [ -n "$second_lower" ]; then
+            # Example:
+            #   #SCT#AU5
+            #
+            # Technical name:
+            #   sct_au5
+            #
+            # ABAP name:
+            #   /sct/au5
+            #
+            # Git filename:
+            #   #sct#au5
+            #
+            # Clean name (for strings/comments):
+            #   sctau5
+            tech_namespace="${first_lower}_${second_lower}"
+            sap_namespace="/${first_lower}/${second_lower}"
+            git_namespace="#${first_lower}#${second_lower}"
+            clean_namespace="${first_lower}${second_lower}"
+            branch_name="rename_${first_lower}_${second_lower}"
 
-    - name: Push renamed branch
-      run: |
-        b="$BRANCH"
-        git config user.name 'github-actions[bot]'
-        git config user.email 'github-actions[bot]@users.noreply.github.com'
-        git fetch origin "$b" --depth 1 2>/dev/null || true
-        parent=$(git rev-parse -q --verify "refs/remotes/origin/$b" || true)
-        index="$RUNNER_TEMP/index-$b"
-        rm -f "$index"
-        (cd ".github/out/$b" && GIT_DIR="$GITHUB_WORKSPACE/.git" GIT_WORK_TREE=. GIT_INDEX_FILE="$index" git add -A)
-        tree=$(GIT_INDEX_FILE="$index" git write-tree)
-        if [ -n "$parent" ] && [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
-          echo "$b: no changes"
-          exit 0
-        fi
-        commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -p "$GITHUB_SHA" -m "build: $b from $GITHUB_SHA")
-        git push origin "$commit:refs/heads/$b"
-        echo "$b: pushed $commit"
+            # The underscore belongs to the replacement prefix because
+            # the source object name follows after it:
+            #
+            # sct_au5_IF_APP -> /sct/au5_IF_APP
+            tech_prefix="${tech_namespace}_"
+            sap_prefix="${sap_namespace}_"
+            git_prefix="${git_namespace}_"
+
+          else
+            # Example:
+            #   #SCT#
+            #
+            # Technical name:
+            #   sct
+            #
+            # ABAP name:
+            #   /sct/IF_APP
+            #
+            # Git filename:
+            #   #sct#IF_APP
+            #
+            # Clean name (for strings/comments):
+            #   sct
+            tech_namespace="${first_lower}"
+            sap_namespace="/${first_lower}/"
+            git_namespace="#${first_lower}"
+            clean_namespace="${first_lower}"
+            branch_name="rename_${first_lower}"
+
+            # For a namespace without a second component, the slash at
+            # the end of /sct/ already separates the namespace from the
+            # object name. No additional underscore is added here.
+            #
+            # sct_IF_APP -> /sct/IF_APP
+            tech_prefix="${tech_namespace}_"
+            sap_prefix="${sap_namespace}"
+            git_prefix="${git_namespace}"
+          fi
+
+          # Limit the technical replacement name.
+          if [ "${#tech_namespace}" -gt 10 ]; then
+            echo "::error::Namespace '$NAMESPACE' is too long."
+            echo "::error::Technical namespace '$tech_namespace' exceeds 10 characters."
+            exit 1
+          fi
+
+          # Prevent renaming to the original namespace.
+          if [ "$tech_namespace" = "z2ui5" ]; then
+            echo "::error::Namespace '$NAMESPACE' is the original namespace - nothing to rename."
+            exit 1
+          fi
+
+          echo "TECH_NAMESPACE=$tech_namespace" >> "$GITHUB_ENV"
+          echo "SAP_NAMESPACE=$sap_namespace" >> "$GITHUB_ENV"
+          echo "GIT_NAMESPACE=$git_namespace" >> "$GITHUB_ENV"
+          echo "CLEAN_NAMESPACE=$clean_namespace" >> "$GITHUB_ENV"
+          echo "TECH_PREFIX=$tech_prefix" >> "$GITHUB_ENV"
+          echo "SAP_PREFIX=$sap_prefix" >> "$GITHUB_ENV"
+          echo "GIT_PREFIX=$git_prefix" >> "$GITHUB_ENV"
+          echo "BRANCH=$branch_name" >> "$GITHUB_ENV"
+
+          echo "Input namespace:       $NAMESPACE"
+          echo "Technical namespace:   $tech_namespace"
+          echo "ABAP code namespace:   $sap_namespace"
+          echo "Git filename namespace: $git_namespace"
+          echo "Clean namespace:       $clean_namespace"
+          echo "Branch:                $branch_name"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup
+        with:
+          npm-ci: "true"
+
+      # ---------------------------------------------------------------
+      # Run abaplint with a valid technical namespace.
+      #
+      # Important:
+      #   abaplint receives sct or sct_au5.
+      #   It does not receive #sct# or /sct/.
+      # ---------------------------------------------------------------
+      - name: Rename with abaplint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sed "s/znamespace/$TECH_NAMESPACE/g" \
+            .github/abaplint/rename.jsonc \
+            > .github/abaplint/rename_run.jsonc
+
+          npx abaplint .github/abaplint/rename_run.jsonc --rename
+
+      # ---------------------------------------------------------------
+      # Convert the result after abaplint.
+      #
+      # Content:
+      #   sct_au5_IF_AJSON -> /sct/au5_IF_AJSON
+      #
+      # Filename:
+      #   sct_au5_IF_AJSON.clas.abap
+      #   -> #sct#au5_IF_AJSON.clas.abap
+      # ---------------------------------------------------------------
+      - name: Convert namespace in code and filenames
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export TECH_PREFIX
+          export SAP_PREFIX
+          export GIT_PREFIX
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          tech_prefix = os.environ["TECH_PREFIX"]
+          sap_prefix = os.environ["SAP_PREFIX"]
+          git_prefix = os.environ["GIT_PREFIX"]
+
+          output = Path(".github/abaplint/output")
+
+          # Replace namespace references inside generated text files.
+          for path in sorted(
+              output.rglob("*"),
+              key=lambda item: len(item.parts),
+              reverse=True,
+          ):
+              if not path.is_file():
+                  continue
+
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  continue
+
+              # Skip binary files.
+              if b"\x00" in data:
+                  continue
+
+              try:
+                  text = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+
+              # Lowercase technical names.
+              #
+              # sct_au5_IF_AJSON
+              # -> /sct/au5_IF_AJSON
+              text = text.replace(tech_prefix, sap_prefix)
+
+              # Uppercase technical names, if present.
+              #
+              # SCT_AU5_IF_AJSON
+              # -> /SCT/AU5_IF_AJSON
+              text = text.replace(
+                  tech_prefix.upper(),
+                  sap_prefix.upper(),
+              )
+
+              path.write_text(text, encoding="utf-8")
+
+          # Rename generated files.
+          for path in sorted(
+              output.rglob("*"),
+              key=lambda item: len(item.parts),
+              reverse=True,
+          ):
+              if not path.exists() or not path.is_file():
+                  continue
+
+              old_name = path.name
+
+              # Lowercase filename prefix.
+              #
+              # sct_au5_IF_AJSON.clas.abap
+              # -> #sct#au5_IF_AJSON.clas.abap
+              new_name = old_name.replace(
+                  tech_prefix,
+                  git_prefix,
+              )
+
+              # Uppercase filename prefix.
+              new_name = new_name.replace(
+                  tech_prefix.upper(),
+                  git_prefix,
+              )
+
+              if new_name != old_name:
+                  path.rename(path.with_name(new_name))
+          PY
+
+      # ---------------------------------------------------------------
+      # Replace remaining z2ui5 occurrences in strings and comments.
+      #
+      # After abaplint rename, there might still be z2ui5 references in:
+      #   - Comments
+      #   - String literals
+      #   - Documentation
+      #   - Configuration values
+      #
+      # Special handling for ABAP objects (case-sensitive):
+      #   - Z2UI5_IF_* (uppercase) -> /SAP/NAMESPACE/_IF_*
+      #   - z2ui5_if_* (lowercase) -> /sap/namespace/_if_*
+      #   - Z2UI5_CL_* (uppercase) -> /SAP/NAMESPACE/_CL_*
+      #   - z2ui5_cl_* (lowercase) -> /sap/namespace/_cl_*
+      #
+      # Other occurrences (comments, strings) are replaced with
+      # the clean namespace (without #, /, _).
+      #
+      # Examples:
+      #   "z2ui5" -> "sctau5"
+      #   'z2ui5_' -> 'sctau5_'
+      #   Z2UI5 -> SCTAU5
+      #   Z2UI5_IF_APP -> /SCT/AU5_IF_APP
+      #   z2ui5_if_app -> /sct/au5_if_app
+      #   Z2UI5_CL_MODEL -> /SCT/AU5_CL_MODEL
+      #   z2ui5_cl_model -> /sct/au5_cl_model
+      # ---------------------------------------------------------------
+      - name: Replace remaining z2ui5 in strings and comments
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export CLEAN_NAMESPACE
+          export SAP_NAMESPACE
+
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          clean_namespace = os.environ["CLEAN_NAMESPACE"]
+          sap_namespace = os.environ["SAP_NAMESPACE"]
+          sap_namespace_upper = sap_namespace.upper()
+          sap_namespace_lower = sap_namespace.lower()
+          
+          output = Path(".github/abaplint/output")
+
+          leftover = []
+
+          for path in sorted(output.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+              if not path.is_file():
+                  continue
+
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  continue
+
+              if b"\x00" in data:
+                  continue
+
+              try:
+                  text = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+
+              original_text = text
+
+              # Handle Z2UI5_IF_* (uppercase interfaces)
+              # Z2UI5_IF_APP -> /SCT/AU5_IF_APP
+              text = text.replace(
+                  "Z2UI5_IF_",
+                  sap_namespace_upper.rstrip('/') + "_IF_"
+              )
+
+              # Handle z2ui5_if_* (lowercase interfaces)
+              # z2ui5_if_app -> /sct/au5_if_app
+              text = text.replace(
+                  "z2ui5_if_",
+                  sap_namespace_lower.rstrip('/') + "_if_"
+              )
+
+              # Handle Z2UI5_CL_* (uppercase classes)
+              # Z2UI5_CL_MODEL -> /SCT/AU5_CL_MODEL
+              text = text.replace(
+                  "Z2UI5_CL_",
+                  sap_namespace_upper.rstrip('/') + "_CL_"
+              )
+
+              # Handle z2ui5_cl_* (lowercase classes)
+              # z2ui5_cl_model -> /sct/au5_cl_model
+              text = text.replace(
+                  "z2ui5_cl_",
+                  sap_namespace_lower.rstrip('/') + "_cl_"
+              )
+
+              # Replace remaining uppercase z2ui5 in comments and string literals
+              # with the uppercase clean namespace
+              text = text.replace("Z2UI5", clean_namespace.upper())
+
+              # Replace remaining lowercase z2ui5 in comments and string literals
+              # with the lowercase clean namespace
+              text = text.replace("z2ui5", clean_namespace.lower())
+
+              if text != original_text:
+                  path.write_text(text, encoding="utf-8")
+
+              matches = len(re.findall(r"(?i)z2ui5", text))
+              if matches:
+                  leftover.append((str(path), matches))
+
+          if leftover:
+              print("::warning::Found remaining z2ui5 references after cleanup. Continuing anyway.")
+              for file_path, count in leftover[:20]:
+                  print(f"::warning::  {file_path}: {count} matching occurrence(s)")
+              if len(leftover) > 20:
+                  print(f"::warning::  ... and {len(leftover) - 20} more file(s)")
+          else:
+              print("::notice::No z2ui5 references remain after cleanup.")
+          PY
+
+      # ---------------------------------------------------------------
+      # Assemble the generated branch.
+      # ---------------------------------------------------------------
+      - name: Assemble branch content
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          src="$(find .github/abaplint/output -type d -name src | head -n 1)"
+
+          if [ -z "$src" ]; then
+            echo "::error::No renamed src folder found under .github/abaplint/output"
+            exit 1
+          fi
+
+          out=".github/out/$BRANCH"
+
+          rm -rf "$out"
+          mkdir -p "$out"
+
+          cp -r "$src" "$out/src"
+          cp LICENSE "$out/"
+
+          # The version constant must use the slash notation because
+          # this value is interpreted as ABAP code by abapGit.
+          #
+          # Example:
+          #   /sct/au5_IF_APP=>VERSION
+          version_constant="${SAP_NAMESPACE}_IF_APP=>VERSION"
+
+          sed "s#Z2UI5_IF_APP=&gt;VERSION#${version_constant}#" \
+            .abapgit.xml \
+            > "$out/.abapgit.xml"
+
+      # ---------------------------------------------------------------
+      # Push the generated branch.
+      # ---------------------------------------------------------------
+      - name: Push renamed branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          b="$BRANCH"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          git fetch origin "$b" --depth 1 2>/dev/null || true
+
+          parent="$(git rev-parse -q --verify "refs/remotes/origin/$b" || true)"
+
+          index="$RUNNER_TEMP/index-$b"
+          rm -f "$index"
+
+          (
+            cd ".github/out/$b"
+
+            export GIT_DIR="$GITHUB_WORKSPACE/.git"
+            export GIT_WORK_TREE=.
+            export GIT_INDEX_FILE="$index"
+
+            git add -A
+          )
+
+          tree="$(GIT_INDEX_FILE="$index" git write-tree)"
+
+          if [ -n "$parent" ] &&
+             [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
+            echo "$b: no changes"
+            exit 0
+          fi
+
+          if [ -n "$parent" ]; then
+            commit="$(
+              git commit-tree \
+                "$tree" \
+                -p "$parent" \
+                -p "$GITHUB_SHA" \
+                -m "build: $b from $GITHUB_SHA"
+            )"
+          else
+            commit="$(
+              git commit-tree \
+                "$tree" \
+                -p "$GITHUB_SHA" \
+                -m "build: $b from $GITHUB_SHA"
+            )"
+          fi
+
+          git push origin "$commit:refs/heads/$b"
+
+          echo "$b: pushed $commit"
